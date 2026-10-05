@@ -1,0 +1,5 @@
+# ZCode Pet persistent tunnels (pet keeps these SSH reverse tunnels alive)
+# One per line: user@host[:port]   (# comments; edits apply within 60s)
+# Examples:
+# user@your-server.example.com:22
+# deploy@203.0.113.10:2222

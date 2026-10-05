@@ -1,0 +1,18 @@
+# runtime artifacts
+pet.log
+selftest/
+__pycache__/
+*.pyc
+*.pyo
+
+# local/private configuration (contains your own servers!)
+tunnels.txt
+
+# hook-install backups
+*.bak-zcodepet*
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
