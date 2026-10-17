@@ -1,163 +1,114 @@
-<div align="center">
+# ZCode Pet — ZCode 任务进度桌宠
 
-# 🟡 ZCode Pet
+把 ZCode 的粗体「Z」Logo 拟人化成一只桌宠，通过 **ZCode 官方 hooks** 接收你真实会话的事件，
+实时提示任务进度：提交任务→思考、执行工具→显示工具名与步数、**等权限→提醒你**、完成→打勾。
 
-**A task-progress desktop pet for [ZCode](https://z.ai) — your AI coding sessions, alive on your desktop.**
+视觉遵循 ZCode 官方设计 token：品牌黄 `#FEBC2E` / 主背景 `#161616` / 终端面 `#0F0F0F` / 成功 `#4ADE80`。
 
-[中文说明](README.zh-CN.md) · English · **Author: [@Hai-mian-33](https://github.com/Hai-mian-33)**
+## 远程服务器（SSH）任务提醒
 
-`Windows` `Python 3.9+` `PyQt5` `MIT License`
+### 生命周期：随 ZCode 而来、随 ZCode 而去
 
-<img src="docs/screenshots/hero.png" width="620" alt="ZCode Pet states" />
+- **开机不自启**。ZCode 一打开（会话启动/提交任务触发钩子），桌宠自动静默出现
+- **ZCode 进程关闭时，桌宠自动随之退出**（内置监视器每 4 秒检查一次，连续 2 次检测不到才退，ZCode 重启瞬间不会误杀；退出前自动保存位置）
+- 因此不要再启用 `setup_autostart.bat`（那是开机常驻，与该行为冲突）
+- 边界说明：只用远程服务器时，桌面端 ZCode 一关桌宠也会退出（远程事件靠隧道推给桌宠）；重新打开 ZCode 或提交任意本地任务它就会回来
 
-</div>
+### 随 ZCode 自动打开
 
----
+本机钩子里，`SessionStart` / `UserPromptSubmit` 两个事件额外携带一个「拉起器」
+（`pet_launcher.py`）：桌宠没在运行时，你一在 ZCode 里开会话或提交任务，桌宠就会
+自动静默启动（毫秒级、无黑窗口、单实例保护不会重复）。已在运行时触发则无任何动作。
 
-ZCode Pet is an anthropomorphized version of the ZCode "Z" logo that lives on your
-desktop and **reflects what your ZCode sessions are actually doing in real time**:
-it thinks when you submit a task, shows every tool call with a step counter,
-**nags you when ZCode waits for your permission**, celebrates with a ✓ when a task
-finishes — and can be clicked to jump straight back into ZCode.
+### SSH 服务器
 
-It works with **local ZCode sessions and remote ones over SSH** (via reverse tunnels),
-tracks multiple concurrent sessions without mixing them up, and speaks
-**Chinese and English** (switchable in the right-click menu).
+已配置 4 台 OpenLoopEvolve 服务器（166.111.73.140 / .80 / .100 / .57）：
 
-## ✨ Features
+- **常驻隧道**：桌宠读取 `tunnels.txt`（`user@host[:port]` 每行一条），自动为每台服务器维持
+  `ssh -N -R 8765` 反向隧道并保活；断线 60 秒内自动重连。增删服务器改这个文件即可，60 秒内生效。
+  `~/.ssh/config` 里的 `Match` 块保留作为兜底（你自己开的 SSH 会话也会尝试建隧道，谁先绑到谁生效，冲突无害）。
+- **服务器侧钩子（v2）**：`setup_hooks_unix.py` 已部署到 4 台服务器，使用 `type:"command"`
+  （shell 管道传 stdin，兼容各版本 ZCode），curl 超时 4 秒 + `|| true`，永不阻塞远程任务。
+- **多会话显示**：本机与远程会话独立跟踪状态，按「等确认 > 执行 > 思考 > 完成」聚合显示，
+  互不覆盖；远程事件在状态行和托盘通知中标注「远程」。
 
-- 🎯 **Real progress, not a toy** — driven by ZCode official hooks
-  (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`,
-  `PostToolUse`, `PostToolUseFailure`, `Stop`); supports both `snake_case` and
-  `camelCase` payload styles.
-- 🃏 **Foldable card stack** — one card per session: task title, live status,
-  step counter, elapsed time; completed cards stay pinned with a green ✓ and the
-  result summary **until you click them**, then they disappear for good.
-- 🐾 **Click to jump** — click the pet to focus the ZCode window; click a card
-  to jump to that conversation.
-- 📌 **Edge aware** — the pet can never be dragged off-screen; cards flip below
-  the pet when there is no room above.
-- 🔁 **Follows ZCode's lifecycle** — appears when ZCode starts (hook launcher),
-  exits when the ZCode process closes (built-in process monitor).
-- 🖥 **Remote friendly** — keeps SSH reverse tunnels alive (see `tunnels.txt`)
-  so tasks running on your Linux servers show up too; remote cards are tagged.
-- 🌏 **Bilingual** — Chinese / English UI, switchable at runtime, persisted.
-- 🔇 **Zero noise** — detailed logs go to `pet.log`, the desktop stays clean.
+生效条件：**桌宠在运行**（隧道由桌宠自己维持，不再依赖你手头的 SSH 会话）。
+排查：`zcode-pet/pet.log` 里 `[tunnel]` 行是隧道状态，`[raw]` 是原始事件；远程服务器上
+`python3 /tmp/zcode_pet_hooks.py --show` 可查钩子。新服务器接入 = `tunnels.txt` 加一行 +
+服务器跑一次 `setup_hooks_unix.py`。
 
-## 📸 Screenshots
+## 日常启动 / 关闭 / 自启
 
-![](docs/screenshots/hero.png)
-*Idle · Thinking · Executing · Waiting for your confirmation · Done ✓*
+- **启动**：双击 `ZCodePet.bat`（无黑窗口）。若桌宠已在运行（哪怕被隐藏），双击会让它**显示并置顶**；不会有第二个实例
+- **关闭**：托盘图标右键 → 退出（或小宠右键 → 退出）
+- **开机自动启动**：双击 `setup_autostart.bat`（登录 Windows 后静默自启）；取消用 `remove_autostart.bat`；查询 `python autostart.py status`
+- 桌宠关闭期间 ZCode 完全不受影响；下次启动桌宠会自动恢复上次的窗口位置并继续接收 hooks 事件
 
-**Task cards** stay pinned above the pet — running tasks and finished tasks
-(green ✓ with the result summary) alike — until you click them:
-
-| 中文界面 | English UI |
-|---|---|
-| ![](docs/screenshots/cards-stack-zh.png) | ![](docs/screenshots/cards-stack-en.png) |
-
-When ZCode waits for your permission, the pet raises a card and a system
-notification:
-
-| Pet state | Card |
-|---|---|
-| ![](docs/screenshots/pet-waiting-zh.png) | ![](docs/screenshots/bubble-waiting-zh.png) |
-
-> All screenshots above are rendered by `tools/gen_screenshots.py` —
-> regenerate them any time with `python tools/gen_screenshots.py`.
-
-## 🚀 Quick Start (Windows)
-
-```bat
-:: 1. install the dependency
-pip install PyQt5
-
-:: 2. install the hooks (writes to ~/.zcode/cli/config.json, auto-backup)
-python setup_hooks.py
-
-:: 3. start the pet (no console window)
-scripts\ZCodePet.bat
-```
-
-Open ZCode, submit any task — the pet appears and starts reporting.
-
-### Linux / macOS servers (remote progress)
+## 快速开始
 
 ```bash
-# on each server: install the hook (events travel back over an SSH tunnel)
-python3 setup_hooks_unix.py
+# ① 安装钩子（写入 ~/.zcode/cli/config.json，自动备份原文件，可重复执行）
+python setup_hooks.py
+
+# ② 启动桌宠（仅依赖 PyQt5）
+python zcode_pet.py
+
+# ③ 新开一个 ZCode 会话，随便提交一个任务 —— 小宠开始实时播报进度
+#   （已开启的旧会话不会热加载钩子）
 ```
 
-Then list your servers in `tunnels.txt` (copy `tunnels.txt.example`) — the pet
-keeps one `ssh -N -R 8765` tunnel alive per server automatically. The reverse
-forward is also declared in `~/.ssh/config` by `setup_hooks.py` instructions
-below if you prefer a manual setup.
+## 交互方式
 
-## ⚙️ How it works
-
-```
-ZCode session ──hooks──▶ curl POST 127.0.0.1:8765/event ──▶ ZCode Pet
-                              │
-        remote server ──SSH -R 8765──┘  (tunnels kept alive by the pet)
-```
-
-1. `setup_hooks.py` registers one hook per ZCode event. Each hook is a
-   `curl` POST of the event JSON to `127.0.0.1:8765` — if the pet is closed,
-   the curl fails in milliseconds and **ZCode is never blocked**.
-2. A tiny launcher hook (`pet_launcher.py`) silently starts the pet whenever
-   ZCode starts and the pet is not running.
-3. When the ZCode process closes, the pet's built-in monitor notices and the
-   pet exits gracefully.
-
-## 🧩 Repository layout
-
-```
-ZCode-pet/
-├── zcode_pet.py            # the pet: event server, state machine, rendering
-├── pet_launcher.py         # hook helper: start the pet if it isn't running
-├── setup_hooks.py          # install/remove hooks on Windows
-├── setup_hooks_unix.py     # install/remove hooks on Linux/macOS
-├── demo_events.py          # send fake hook events for end-to-end testing
-├── autostart.py            # optional: start the pet at Windows login
-├── scripts/                # double-click helpers (.bat)
-├── tools/gen_screenshots.py# regenerate README screenshots offscreen
-├── tunnels.txt.example     # template for remote SSH servers
-├── docs/                   # screenshots + bilingual docs
-├── README.md / README.zh-CN.md
-└── LICENSE
-```
-
-## 🌏 Language
-
-Right-click the pet → **Language / 语言** → 中文 / English. The choice is
-persisted. You can also set the `PET_LANG=zh|en` environment variable.
-
-## 🛠 Configuration
-
-| File / switch | Purpose |
+| 操作 | 效果 |
 |---|---|
-| `tunnels.txt` | One `user@host[:port]` per line; the pet keeps an SSH reverse tunnel to each server (copy from `tunnels.txt.example`) |
-| `PET_LANG=zh\|en` | UI language (default: system language) |
-| `scripts/setup_autostart.bat` | Optional: start the pet at Windows login (off by default — the pet follows ZCode's lifecycle) |
-| Right-click menu | Fold/expand cards, hide cards, demo task, reset position, language, quit |
+| **单击宠物** | **直接跳转 ZCode 窗口**（最小化会还原并置前） |
+| **单击任务卡片** | **跳转到该对话所在的 ZCode 窗口**；点卡片外的空白处 = 折叠/展开 |
+| 卡片生命周期 | 进行中的任务**常驻**显示；**完成后也一直显示**（含结果摘要），直到**你点击它跳转 ZCode 后才消失**（折叠/展开都不再出现） |
+| 边缘保护 | 拖动全程贴边钳制，宠物整体拖不出桌面（不遮任务栏，多显示器各自生效）；贴边时卡片自动收进屏幕，顶部没空间会翻到小宠下方 |
+| 显示大小 | 固定物理像素渲染：外接屏/内屏之间移动**大小恒定不再忽大忽小**；右键 →「大小」可选 小/标准/大/特大（记住偏好） |
+| 右键小宠 | 气泡：折叠/展开 · 隐藏任务卡片（隐藏后本任务期间不再自动弹出，下个任务恢复）· 演示一轮 · 重置位置 · 退出 |
+| 拖拽 | 移动位置（卡片跟随，自动记住，重启还原） |
+| `Ctrl+Alt+Z` | 全局呼出 / 隐藏（ZCode 会话中也能按） |
+| 托盘图标 | 左键点击 显示/隐藏；菜单含全部操作；权限等待与任务完成弹 Windows 通知 |
+| 详细日志 | 写入 `zcode-pet/pet.log`（含每种钩子事件的原始 JSON），不占桌面 |
 
-## ❓ FAQ
+## 小宠状态
 
-- **Does it block or slow down ZCode?** No. Hooks are millisecond `curl` calls;
-  if the pet is closed they fail instantly and silently.
-- **How do I uninstall?** `python setup_hooks.py --remove` (also removes the
-  launcher), then quit the pet from its tray menu.
-- **A hook fired but nothing happened?** Check `pet.log` — every raw event is
-  logged there, including `[raw]` payloads and tunnel status.
-- **Privacy?** Everything runs locally. The only network traffic is
-  `curl` to `127.0.0.1` and the SSH tunnels you configure yourself.
+| 状态 | 触发事件 | 表现 |
+|---|---|---|
+| thinking | `UserPromptSubmit` | 头顶冒 Z 字气泡，任务卡开始计时 |
+| executing | `PreToolUse` / `PostToolUse` | 显示当前工具名、已执行步数、耗时 |
+| **waiting** | `PermissionRequest` | 橙色感叹气泡 + 托盘通知「等你确认」 |
+| done | `Stop` | 闭眼笑 ✓ + 进度 100% + 托盘通知 |
+| （日志） | `PostToolUseFailure` | 红色失败记录，小宠抖一下 |
 
-## 👤 Author
+## 测试与演示
 
-**Sun Haiming (孙海铭)** — [@Hai-mian-33](https://github.com/Hai-mian-33) · haiming.sun33@gmail.com
+```bash
+python zcode_pet.py --demo        # 不开 ZCode，内置一轮完整任务演示
+python demo_events.py             # 向运行中的桌宠发送与真实 hooks 同格式的事件序列（端到端联调）
+python zcode_pet.py --selftest    # 离屏渲染各状态到 selftest/*.png（无窗口）
+python setup_hooks.py --show      # 查看当前 hooks 配置
+```
 
-Developer: Sun Haiming. Contributions and issues are welcome!
+## 卸载
 
-## 📄 License
+```bash
+python setup_hooks.py --remove    # 只移除 zcode-pet 添加的钩子，配置自动备份
+```
+然后关闭桌宠（托盘 → 退出）即可。
 
-[MIT](LICENSE)
+## 常见问题
+
+- **桌宠没开时，ZCode 会受影响吗？**
+  不会。钩子只是 curl 一次 `127.0.0.1:8765`，连接被拒毫秒级失败，ZCode 日志里记一条
+  hook 失败而已，不阻塞任何操作。想让日志也干净，就保持桌宠常驻，或 `--remove` 卸载。
+- **钩子装了但小宠没反应？**
+  钩子在**新开的会话**才生效；用 `python setup_hooks.py --show` 确认 7 个事件都在且
+  `hooks.enabled: true`；确认桌宠已启动（托盘有图标）。
+- **端口被占了？**
+  桌宠自动从 8765 往后找 10 个端口；若换了端口，同步改 `setup_hooks.py` 顶部的
+  `PET_URL` 后重装钩子。
+- **修改了事件字段映射？**
+  每种钩子事件的原始 JSON 会以 `[raw]` 记录在 `zcode-pet/pet.log` 里，字段名对不上时
+  照着改 `zcode_pet.py` 里 `_ev_*` 各函数即可。

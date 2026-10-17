@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# Author: Sun Haiming (孙海铭) · https://github.com/Hai-mian-33
 """
 ZCode Pet 端到端联调脚本
 ========================

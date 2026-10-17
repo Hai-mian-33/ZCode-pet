@@ -1,4 +1,4 @@
 @echo off
-rem Enable boot autostart (run at Windows login)
-python "%~dp0..utostart.py" on
+rem 双击 = 开机自动启动桌宠
+python "%~dp0autostart.py" on
 pause

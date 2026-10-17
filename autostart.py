@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# Author: Sun Haiming (孙海铭) · https://github.com/Hai-mian-33
 """
 ZCode Pet 开机自启管理（写入/移除 Windows 登录自启项）
 ======================================================
@@ -18,7 +17,7 @@ except Exception:
     pass
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-TARGET = os.path.normpath(os.path.join(BASE, "..", "zcode_pet.py"))
+TARGET = os.path.join(BASE, "zcode_pet.py")
 STARTUP = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                        "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
 VBS = os.path.join(STARTUP, "ZCodePet.vbs")

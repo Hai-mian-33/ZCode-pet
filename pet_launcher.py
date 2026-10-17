@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# Author: Sun Haiming (孙海铭) · https://github.com/Hai-mian-33
 """
 ZCode Pet 拉起器 —— 由本机钩子在 SessionStart / UserPromptSubmit 时调用。
 桌宠已在运行（8765~8769 任一端口有响应）→ 立即退出；
@@ -46,11 +45,25 @@ def start_pet():
                      cwd=BASE)
 
 
+def show_running():
+    """桌宠已运行 → 请求它显示并置顶。"""
+    import urllib.request
+    for port in PORT_RANGE:
+        try:
+            urllib.request.urlopen("http://127.0.0.1:{0}/show".format(port), timeout=0.6)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def main():
     try:
-        if os.path.exists(PET) and not pet_running():
-            start_pet()
-            time.sleep(0.2)  # 稍等，避免同一批钩子里重复拉起
+        if pet_running():
+            show_running()          # 已在运行：让现身的显示出来
+        elif os.path.exists(PET):
+            start_pet()             # 未运行：静默拉起
+            time.sleep(0.2)
     except Exception:
         pass
     sys.exit(0)

@@ -1,3 +1,3 @@
 @echo off
-rem ZCode Pet launcher (no console window)
-start "" pythonw "%~dp0..\zcode_pet.py"
+rem ZCode Pet 双击启动器（pythonw 无黑窗口）
+start "" pythonw "%~dp0zcode_pet.py"

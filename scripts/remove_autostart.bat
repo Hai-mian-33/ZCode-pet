@@ -1,4 +1,4 @@
 @echo off
-rem Disable boot autostart
-python "%~dp0..utostart.py" off
+rem 双击 = 取消开机自动启动
+python "%~dp0autostart.py" off
 pause

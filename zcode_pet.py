@@ -1,24 +1,17 @@
 # -*- coding: utf-8 -*-
-# Author: Sun Haiming (孙海铭) · https://github.com/Hai-mian-33
 """
-ZCode Pet — a task-progress desktop pet for ZCode (bilingual UI: 中文 / English)
-================================================================================
-Data source : ZCode official hooks (SessionStart / UserPromptSubmit / PreToolUse /
-              PermissionRequest / PostToolUse / PostToolUseFailure / Stop)
-              → curl POST 127.0.0.1:<PORT>/event → the pet renders live progress.
-              Both snake_case and camelCase payload styles are supported.
-Lifecycle   : the pet appears when ZCode starts (hook launcher) and exits when
-              the ZCode process closes (built-in process monitor).
-Sessions    : every session gets its own state; cards are aggregated by priority
-              (waiting > executing > thinking > done) so they never overwrite
-              each other. Remote sessions are tagged.
-Tunnels     : the pet keeps SSH reverse tunnels (tunnels.txt) alive so remote
-              events can reach it.
-Visual      : ZCode brand tokens (#FEBC2E amber / #161616 dark), single-stroke
-              rounded "Z" character.
-Usage       : python zcode_pet.py [--demo] [--selftest] [--port 8765]
-Language    : PET_LANG=zh|en env var, right-click menu switch, persisted.
-Dependency  : pip install PyQt5
+ZCode Pet — 智谱 ZCode Logo 拟人化桌宠（真实任务进度版）
+=========================================================
+数据源：ZCode 官方 hooks（SessionStart / UserPromptSubmit / PreToolUse /
+        PermissionRequest / PostToolUse / PostToolUseFailure / Stop）
+        → curl POST 127.0.0.1:<PORT>/event → 桌宠实时显示任务进度
+        兼容 snake_case / camelCase 两种事件字段格式。
+多会话：每个会话独立跟踪状态，按优先级聚合显示（等确认 > 执行 > 思考 > 完成），
+        互不覆盖；远程会话在气泡/托盘通知中标注「远程」。
+隧道：  桌宠自动维持 tunnels.txt 中服务器的 SSH 反向隧道（断线自动重连）。
+视觉：  ZCode 官方设计 token（#FEBC2E 品牌黄），Z 字单笔圆角描边。
+运行：  python zcode_pet.py [--demo] [--selftest] [--port 8765]
+依赖：  pip install PyQt5
 """
 import sys
 import os
@@ -34,197 +27,182 @@ import subprocess
 
 try:
     from PyQt5.QtCore import (Qt, QTimer, pyqtSignal, QObject, QPoint, QPointF,
-                              QRectF, QSettings, QLockFile, QAbstractNativeEventFilter,
-                              QLocale)
+                              QRectF, QSettings, QLockFile, QAbstractNativeEventFilter)
     from PyQt5.QtGui import (QPainter, QColor, QBrush, QPen, QLinearGradient, QFont,
                              QPainterPath, QIcon, QPixmap, QGuiApplication, QPolygonF)
     from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout,
                                  QHBoxLayout, QMenu, QSystemTrayIcon, QFrame,
                                  QGraphicsDropShadowEffect)
 except ImportError:
-    print("Please install the dependency first: pip install PyQt5 / 请先安装依赖: pip install PyQt5")
+    print("请先安装依赖: pip install PyQt5")
     sys.exit(1)
 
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-# ========== ZCode brand tokens (do not change) ==========
-BRAND     = "#FEBC2E"
-BG        = "#161616"
+# ========== ZCode 官方设计 Token（勿改）==========
+BRAND     = "#FEBC2E"   # 品牌黄
+BG        = "#161616"   # 主背景（气泡底色）
 BORDER    = "#2A2A2A"
 FG        = "#FFFFFF"
 FG_SUBTLE = "#A1A1A1"
 SUCCESS   = "#4ADE80"
 DESTRUCT  = "#EF4444"
 WARNING   = "#FBBF24"
-WAITING   = "#F97316"
+WAITING   = "#F97316"   # 等待确认（橙）
 RAW_DIM   = "#6B6B6B"
 
 DEFAULT_PORT = 8765
-PET_SIZE     = (140, 148)
-BUBBLE_W     = 300
+PET_SIZE     = (140, 148)   # 小宠常驻尺寸（与其他桌宠同量级，无大片隐形留白）
+BUBBLE_W     = 300          # 状态气泡宽度（独立置顶横幅小窗）
 BUBBLE_H     = 72
-DONE_WINDOW  = 8.0
+DONE_WINDOW  = 8.0          # 完成状态停留秒数
 LOG_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pet.log")
 TUNNELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnels.txt")
 
+# 多会话聚合显示优先级：越小越优先
 PRIORITY = {"waiting": 0, "executing": 1, "thinking": 2, "done": 3, "idle": 4}
 
-# ========== Bilingual strings (中文 / English) ==========
-I18N = {
-    "zh": {
-        "chip_thinking":  "◐思考中",
-        "chip_exec":      "▸{tool}·{steps}步·{t}",
-        "chip_wait":      "⏸确认{tool}",
-        "chip_done":      "✓{steps}步·{t}",
-        "chip_idle":      "●待命",
-        "full_thinking":  "◐ {w}thinking · 分析任务…",
-        "full_exec":      "▸ {w}{tool} · {steps}步 · {t}",
-        "full_wait":      "⏸ {w}等你确认 {tool}",
-        "full_done":      "✓ {w}done · {steps}步 · {t}",
-        "full_idle":      "● idle · 待命",
-        "card_untitled":  "（未命名任务）",
-        "card_done_res":  "{w}已完成 · {result}",
-        "card_done":      "{w}已完成 · {steps}步 · {t}",
-        "card_exec":      "{w}正在执行 · {tool}",
-        "card_wait":      "{w}等你确认 · {tool}",
-        "card_think":     "{w}分析任务…",
-        "card_idle":      "{w}空闲",
-        "where_remote":   "远程 · ",
-        "bubble_ready":   "就绪 (•̀ᴗ•́)و",
-        "bubble_go":      "开跑 (๑•̀ㅂ•́)و",
-        "bubble_done":    "搞定！✓",
-        "bubble_wait":    "等你确认 (・_・;)",
-        "bubble_zzz":     "待命 zzz",
-        "menu_showhide":  "显示 / 隐藏",
-        "menu_fold":      "气泡：折叠/展开",
-        "menu_hide":      "隐藏任务卡片",
-        "menu_cards":     "显示任务卡片",
-        "menu_demo":      "演示一轮任务",
-        "menu_reset":     "重置位置",
-        "menu_lang":      "Language / 语言",
-        "menu_quit":      "退出",
-        "tray_tip":       "ZCode Pet — 任务进度桌宠",
-        "log_join":       "会话接入 #{sid}（{where}，共 {n} 个）",
-        "log_ready":      "会话就绪（{src}）",
-        "log_new_task":   "{w}新任务：{t}",
-        "log_tool_done":  "{w}✓ {tool} 完成 · 第 {n} 步",
-        "log_tool_fail":  "✗ {tool} 失败 {e}",
-        "log_perm":       "⏸ 等待权限确认：{tool} {snip}",
-        "log_stop":       "{w}★ 任务完成 · {n} 步 · 用时 {t}",
-        "log_jump":       "跳转 ZCode 窗口 {ok}",
-        "log_jump_card":  "点击卡片跳转 ZCode（会话 #{sid}{r}）{ok}",
-        "log_card_ack":   "卡片已查看并移除（会话 #{sid}）",
-        "log_lc_seen":    "已检测到 ZCode 进程 ✓（ZCode 关闭时桌宠将随之退出）",
-        "log_lc_exit":    "ZCode 进程已关闭 → 桌宠随之退出",
-        "log_tunnel_up":  "隧道已建立 → {t}",
-        "log_tunnel_dn":  "隧道断开，准备重试：{t}",
-        "log_tunnel_rm":  "隧道已移除：{t}",
-        "log_tunnel_err": "隧道启动失败 {t}: {e}",
-        "log_empty":      "收到空事件（钩子未传 stdin，请检查远程钩子版本）",
-        "log_unknown":    "未知事件 {n}",
-        "log_lang":       "语言已切换 → 中文",
-        "log_err":        "处理 {n} 出错: {e}",
-        "where_log":      "远程",
-        "local_log":      "本机",
-        "ok_log":         "✓",
-        "ok_miss":        "（未找到窗口）",
-        "remote_log":     "·远程",
-        "untitled_log":   "（未命名任务）",
-        "demo_prompt":    "修复登录页在 1080p 下的按钮折行问题，并补充回归测试",
-        "lang_name":      "中文",
-    },
-    "en": {
-        "chip_thinking":  "◐Thinking",
-        "chip_exec":      "▸{tool}·{steps}·{t}",
-        "chip_wait":      "⏸Confirm {tool}",
-        "chip_done":      "✓{steps}·{t}",
-        "chip_idle":      "●Idle",
-        "full_thinking":  "◐ {w}Thinking · analyzing…",
-        "full_exec":      "▸ {w}{tool} · {steps} steps · {t}",
-        "full_wait":      "⏸ {w}Waiting for you: {tool}",
-        "full_done":      "✓ {w}Done · {steps} steps · {t}",
-        "full_idle":      "● idle · standby",
-        "card_untitled":  "(Untitled task)",
-        "card_done_res":  "{w}Completed · {result}",
-        "card_done":      "{w}Completed · {steps} steps · {t}",
-        "card_exec":      "{w}Running · {tool}",
-        "card_wait":      "{w}Waiting · {tool}",
-        "card_think":     "{w}Analyzing…",
-        "card_idle":      "{w}Idle",
-        "where_remote":   "Remote · ",
-        "bubble_ready":   "Ready (•̀ᴗ•́)و",
-        "bubble_go":      "Go! (๑•̀ㅂ•́)و",
-        "bubble_done":    "Done! ✓",
-        "bubble_wait":    "ZCode needs you (・_・;)",
-        "bubble_zzz":     "zzz",
-        "menu_showhide":  "Show / Hide",
-        "menu_fold":      "Cards: Fold / Expand",
-        "menu_hide":      "Hide cards",
-        "menu_cards":     "Show cards",
-        "menu_demo":      "Demo task",
-        "menu_reset":     "Reset position",
-        "menu_lang":      "Language / 语言",
-        "menu_quit":      "Quit",
-        "tray_tip":       "ZCode Pet — task progress desktop pet",
-        "log_join":       "Session joined #{sid} ({where}, {n} total)",
-        "log_ready":      "Session ready ({src})",
-        "log_new_task":   "{w}New task: {t}",
-        "log_tool_done":  "{w}✓ {tool} done · step {n}",
-        "log_tool_fail":  "✗ {tool} failed {e}",
-        "log_perm":       "⏸ Permission needed: {tool} {snip}",
-        "log_stop":       "{w}★ Task done · {n} steps · {t}",
-        "log_jump":       "Jump to ZCode window {ok}",
-        "log_jump_card":  "Card clicked → ZCode (session #{sid}{r}) {ok}",
-        "log_card_ack":   "Card viewed & removed (session #{sid})",
-        "log_lc_seen":    "ZCode process detected ✓ (pet exits when ZCode closes)",
-        "log_lc_exit":    "ZCode closed → pet exits",
-        "log_tunnel_up":  "Tunnel up → {t}",
-        "log_tunnel_dn":  "Tunnel down, retrying: {t}",
-        "log_tunnel_rm":  "Tunnel removed: {t}",
-        "log_tunnel_err": "Tunnel failed {t}: {e}",
-        "log_empty":      "Empty event (hook sent no stdin)",
-        "log_unknown":    "Unknown event {n}",
-        "log_lang":       "Language → English",
-        "log_err":        "Error handling {n}: {e}",
-        "where_log":      "Remote",
-        "local_log":      "Local",
-        "ok_log":         "✓",
-        "ok_miss":        "(window not found)",
-        "remote_log":     "·Remote",
-        "untitled_log":   "(Untitled task)",
-        "demo_prompt":    "Fix the login page button wrapping at 1080p and add regression tests",
-        "lang_name":      "English",
-    },
-}
 
-CURRENT_LANG = "zh"
+# ========== Windows 窗口跳转：聚焦 ZCode ==========
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+    _u32 = ctypes.windll.user32
+    _k32 = ctypes.windll.kernel32
+    _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+else:
+    _u32 = _k32 = None
+    _ENUMPROC = None
 
 
-def T(key, **kw):
-    table = I18N.get(CURRENT_LANG) or I18N["zh"]
-    s = table.get(key)
-    if s is None:
-        s = I18N["zh"].get(key, key)
-    return s.format(**kw) if kw else s
+def _zcode_windows():
+    """枚举可见的 ZCode.exe 顶层窗口 → [(hwnd, title), ...]（最前优先）。"""
+    if _u32 is None:
+        return []
+    out = []
+
+    def _cb(h, l):
+        try:
+            if not _u32.IsWindowVisible(h):
+                return True
+            pid = wintypes.DWORD()
+            _u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            k = _k32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
+            if not k:
+                return True
+            try:
+                buf = ctypes.create_unicode_buffer(512)
+                size = wintypes.DWORD(512)
+                if _k32.QueryFullProcessImageNameW(k, 0, buf, ctypes.byref(size)):
+                    if "zcode" in os.path.basename(buf.value).lower():
+                        n = _u32.GetWindowTextLengthW(h)
+                        tb = ctypes.create_unicode_buffer(n + 1)
+                        _u32.GetWindowTextW(h, tb, n + 1)
+                        out.append((h, tb.value))
+            finally:
+                _k32.CloseHandle(k)
+        except Exception:
+            pass
+        return True
+
+    cb = _ENUMPROC(_cb)
+    _u32.EnumWindows(cb, 0)
+    return out
 
 
-def set_lang(lang):
-    global CURRENT_LANG
-    CURRENT_LANG = lang if lang in I18N else "zh"
-    QSettings("ZCode", "ZCodePet").setValue("lang", CURRENT_LANG)
+def activate_zcode():
+    """把 ZCode 窗口带到前台（最小化则还原）。"""
+    wins = _zcode_windows()
+    if not wins:
+        return False
+    hwnd = wins[0][0]
+    try:
+        if _u32.IsIconic(hwnd):
+            _u32.ShowWindow(hwnd, 9)   # SW_RESTORE
+        else:
+            _u32.ShowWindow(hwnd, 5)   # SW_SHOW
+        # 绕过前台锁定：把当前线程临时挂到前台窗口的输入队列
+        fg = _u32.GetForegroundWindow()
+        cur = _k32.GetCurrentThreadId()
+        fgt = _u32.GetWindowThreadProcessId(fg, None) if fg else 0
+        if fgt and fgt != cur:
+            _u32.AttachThreadInput(cur, fgt, True)
+        _u32.SetForegroundWindow(hwnd)
+        _u32.SetFocus(hwnd)
+        if fgt and fgt != cur:
+            _u32.AttachThreadInput(cur, fgt, False)
+        return True
+    except Exception:
+        return False
 
 
-def _detect_lang():
-    env = os.environ.get("PET_LANG")
-    if env in I18N:
-        return env
-    saved = str(QSettings("ZCode", "ZCodePet").value("lang", "") or "")
-    if saved in I18N:
-        return saved
-    return "zh" if QLocale.system().name().startswith("zh") else "en"
+def _zcode_process_running():
+    """检查 ZCode.exe 进程是否存活（工具链快照，<5ms）。"""
+    if _k32 is None:
+        return True   # 非 Windows 平台不参与生命周期管理
+    TH32CS_SNAPPROCESS = 0x2
+
+    class _PE32(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+
+    snap = _k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == -1:
+        return True   # 快照失败按存活处理，宁可多留不可误退
+    found = False
+    try:
+        e = _PE32()
+        e.dwSize = ctypes.sizeof(e)
+        if _k32.Process32FirstW(snap, ctypes.byref(e)):
+            while True:
+                if "zcode" in str(e.szExeFile).lower():
+                    found = True
+                    break
+                if not _k32.Process32NextW(snap, ctypes.byref(e)):
+                    break
+    finally:
+        _k32.CloseHandle(snap)
+    return found
 
 
-# ========== Event server: hooks → curl POST → Qt main thread ==========
+class ZCodeProcessMonitor(QObject):
+    """生命周期监视：ZCode 进程关闭后，桌宠随之退出。
+    曾检测到过 ZCode 进程才会触发退出（手动单独启动的桌宠不受影响）；
+    连续 2 次检测不到才退，避免 ZCode 重启瞬间误杀。"""
+
+    def __init__(self, log_fn, on_closed, interval_ms=4000):
+        super().__init__()
+        self._log = log_fn
+        self._on_closed = on_closed
+        self.seen = False
+        self.miss = 0
+        self.timer = QTimer(self, interval=interval_ms, timeout=self._check)
+        self.timer.start()
+
+    def _check(self):
+        running = _zcode_process_running()
+        if running:
+            if not self.seen:
+                self._log("lifecycle", "已检测到 ZCode 进程 ✓（ZCode 关闭时桌宠将随之退出）")
+            self.seen = True
+            self.miss = 0
+        elif self.seen:
+            self.miss += 1
+            if self.miss >= 2:
+                self._log("lifecycle", "ZCode 进程已关闭 → 桌宠随之退出")
+                self.timer.stop()
+                self._on_closed()
+
+
+# ========== 事件服务：hooks → curl POST → Qt 主线程 ==========
 class _Bridge(QObject):
     event_received = pyqtSignal(dict)
 
@@ -248,7 +226,7 @@ class _EventHandler(BaseHTTPRequestHandler):
                 payload = {"raw": str(payload)}
         except Exception as e:
             payload = {"parse_error": str(e)}
-        # 204 with no body: hook stdout must stay empty (strict JSON validation)
+        # 204 空响应：钩子 stdout 必须为空（严格 JSON 校验），curl 也不会打印任何东西
         try:
             self.send_response(204)
             self.end_headers()
@@ -257,6 +235,13 @@ class _EventHandler(BaseHTTPRequestHandler):
         BRIDGE.event_received.emit(payload)
 
     def do_GET(self):
+        path = self.path.rstrip("/")
+        if path == "/show":
+            # 让已运行的桌宠显示并置顶（双击 bat / 拉起器触发）
+            BRIDGE.event_received.emit({"hook_event_name": "Show"})
+            self.send_response(204)
+            self.end_headers()
+            return
         body = b"zcode-pet ok\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -265,11 +250,11 @@ class _EventHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *_):
-        pass
+        pass  # 静默
 
 
 class EventServer:
-    """Local HTTP server; uses the first free port starting at the preferred one."""
+    """本地 HTTP 服务，占用第一个可用端口（默认 8765 起）。"""
 
     def __init__(self, preferred_port):
         self.httpd = None
@@ -301,16 +286,16 @@ class EventServer:
                 pass
 
 
-# ========== Persistent tunnels: the pet keeps its own SSH reverse tunnels ==========
+# ========== 常驻隧道管理：桌宠自己维持到服务器的反向隧道 ==========
 class TunnelManager(QObject):
-    """Reads tunnels.txt (one user@host[:port] per line) and maintains
-    `ssh -N -R 8765:127.0.0.1:8765` per server. Exited processes are retried
-    every cycle; coexists with the user's own SSH sessions (first binder wins)."""
+    """读取 tunnels.txt（user@host[:port] 每行一条），为每台服务器维持
+    `ssh -N -R 8765:127.0.0.1:8765`。进程退出/端口被抢时按周期重试，
+    与用户自己的 SSH 会话共存：谁先绑到远程端口谁生效，冲突无害。"""
 
     def __init__(self, log_fn, interval_s=60):
         super().__init__()
         self._log = log_fn
-        self.procs = {}
+        self.procs = {}  # target(str) -> Popen
         self.timer = QTimer(self, interval=interval_s * 1000, timeout=self.ensure)
         self.timer.start()
         self.ensure()
@@ -319,7 +304,8 @@ class TunnelManager(QObject):
     def _targets():
         try:
             with open(TUNNELS_PATH, "r", encoding="utf-8") as f:
-                return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+                lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            return lines
         except Exception:
             return []
 
@@ -335,16 +321,18 @@ class TunnelManager(QObject):
 
     def ensure(self):
         targets = self._targets()
+        # 清理：已退出 / 已不在配置里的进程
         for key in list(self.procs):
             p = self.procs[key]
             if key not in targets:
                 if p.poll() is None:
                     p.terminate()
                 del self.procs[key]
-                self._log("tunnel", T("log_tunnel_rm", t=key))
+                self._log("tunnel", "隧道已移除：{0}".format(key))
             elif p.poll() is not None:
                 del self.procs[key]
-                self._log("tunnel", T("log_tunnel_dn", t=key))
+                self._log("tunnel", "隧道断开，准备重试：{0}".format(key))
+        # 启动缺失的隧道
         for t in targets:
             if self.procs.get(t) is None or self.procs[t].poll() is not None:
                 try:
@@ -354,9 +342,9 @@ class TunnelManager(QObject):
                     p = subprocess.Popen(self._cmd(t), stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL, **kwargs)
                     self.procs[t] = p
-                    self._log("tunnel", T("log_tunnel_up", t=t))
+                    self._log("tunnel", "隧道已建立 → {0}".format(t))
                 except Exception as e:
-                    self._log("tunnel", T("log_tunnel_err", t=t, e=e))
+                    self._log("tunnel", "隧道启动失败 {0}: {1}".format(t, e))
 
     def status(self):
         total = len(self._targets())
@@ -373,11 +361,11 @@ class TunnelManager(QObject):
         self.procs.clear()
 
 
-# ========== Global hotkey Ctrl+Alt+Z (Windows) ==========
+# ========== 全局热键 Ctrl+Alt+Z（Windows）==========
 WM_HOTKEY = 0x0312
 MOD_ALT, MOD_CONTROL = 0x1, 0x2
 VK_Z = 0x5A
-HOTKEY_ID = 0x5A50
+HOTKEY_ID = 0x5A50  # "ZP"
 
 
 class HotkeyFilter(QAbstractNativeEventFilter):
@@ -398,11 +386,10 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
-# ========== Core: the anthropomorphized ZCode "Z" ==========
+# ========== 核心：ZCode Logo 拟人化绘制 ==========
 class ZLogoFace(QWidget):
-    """The bold ZCode "Z" logo turned into a pet: eyes / mouth / thinking
-    bubbles / status lamp. The Z is a single three-segment polyline stroke
-    with round joins so the strokes connect smoothly."""
+    """把 ZCode 的粗体「Z」Logo 拟人化：眼睛/嘴巴/思考气泡/状态灯。
+    Z 字用一条三段折线加粗描边画出（RoundJoin 圆角连接），笔画衔接平滑。"""
 
     MOOD_LAMP = {"idle": FG_SUBTLE, "thinking": WARNING, "executing": BRAND,
                  "waiting": WAITING, "done": SUCCESS}
@@ -419,9 +406,10 @@ class ZLogoFace(QWidget):
         self._anim = QTimer(self, timeout=self._step, interval=90)
         self._anim.start()
 
+    # ---- 动画 ----
     def _do_blink(self):
         if self.mood == "done":
-            return
+            return  # done 是闭眼笑，不再眨
         self.blink = True
         self.update()
         QTimer.singleShot(140, self._end_blink)
@@ -450,6 +438,7 @@ class ZLogoFace(QWidget):
     def shake(self):
         self._shake = 8
 
+    # ---- 绘制 ----
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -471,16 +460,16 @@ class ZLogoFace(QWidget):
         z_y = (h - z_h) / 2 + 6 + dy
         bar = z_h * 0.26
 
-        # shadow layer (slightly thicker, doubles as soft outline)
+        # 阴影层（略粗，兼作柔和描边）
         self._draw_z(p, z_x + 1.5, z_y + 2.5, z_w, z_h, QColor(0, 0, 0, 130), pad=2.0)
 
-        # body (brand gradient, single stroke)
+        # Z 字主体（品牌黄渐变，单笔描边）
         grad = QLinearGradient(z_x, z_y, z_x, z_y + z_h)
         grad.setColorAt(0.0, QColor("#FFD666"))
         grad.setColorAt(1.0, QColor(BRAND))
         self._draw_z(p, z_x, z_y, z_w, z_h, QBrush(grad))
 
-        # ---- eyes (center of the top bar) ----
+        # ---- 眼睛（顶横杠中央）----
         eye_y = z_y + bar * 0.52
         eye_dx = z_w * 0.20
         for side in (-1, 1):
@@ -504,7 +493,7 @@ class ZLogoFace(QWidget):
                 p.setBrush(QColor("white"))
                 p.drawEllipse(QPointF(ex + 1.7, ey - 1.9), 1.7, 1.7)
 
-        # ---- mouth (midpoint of the diagonal stroke) ----
+        # ---- 嘴巴（斜笔画正中点）----
         mouth_x = cx + dx
         mouth_y = z_y + z_h * 0.50
         p.setPen(QPen(QColor("#1A1A1A"), 2.2, Qt.SolidLine, Qt.RoundCap))
@@ -524,7 +513,7 @@ class ZLogoFace(QWidget):
         else:
             p.drawArc(QRectF(mouth_x - 6, mouth_y - 2.5, 12, 9), 200 * 16, 140 * 16)
 
-        # ---- thinking: "Z" bubbles above the head ----
+        # ---- 思考：头顶冒 Z 字气泡（带轻微上浮）----
         if self.mood == "thinking":
             rise = (t // 4) % 3 * 1.5
             for i in range(3):
@@ -539,7 +528,7 @@ class ZLogoFace(QWidget):
                 p.setFont(QFont("Arial", int(fz), QFont.Black))
                 p.drawText(QPointF(bx - fz / 2, by), "Z")
 
-        # ---- waiting: "!" bubble ----
+        # ---- 等待：头顶感叹气泡 ----
         if self.mood == "waiting":
             bx, by = cx + dx + z_w * 0.68, z_y - 7
             pulse = 170 + int(85 * abs(math.sin(t / 2)))
@@ -557,7 +546,7 @@ class ZLogoFace(QWidget):
             p.setFont(QFont("Arial", 10, QFont.Black))
             p.drawText(QPointF(bx - 2.1, by + 4.2), "!")
 
-        # ---- done: sparkles ----
+        # ---- 完成：四角闪光 ----
         if self.mood == "done":
             for (fx, fy) in ((z_x - 6, z_y + 4), (z_x + z_w + 6, z_y + 10),
                              (z_x + 2, z_y + z_h + 4), (z_x + z_w - 4, z_y + z_h - 2)):
@@ -568,7 +557,7 @@ class ZLogoFace(QWidget):
                 p.setPen(Qt.NoPen)
                 p.drawEllipse(QPointF(fx, fy), 2.2, 2.2)
 
-        # ---- status lamp (bottom) ----
+        # ---- 状态灯（底部）----
         lamp = QColor(self.MOOD_LAMP.get(self.mood, FG_SUBTLE))
         glow = QColor(lamp)
         glow.setAlpha(50 + int(50 * abs(math.sin(t / 4))))
@@ -579,8 +568,7 @@ class ZLogoFace(QWidget):
         p.drawEllipse(QPointF(cx, h - 9), 3.1, 3.1)
 
     def _draw_z(self, p, x, y, w, h, stroke, pad=0.0):
-        """Single-stroke Z: top bar → diagonal → bottom bar, thick pen with
-        RoundJoin so the strokes connect smoothly."""
+        """单笔 Z：顶横 → 斜笔 → 底横，粗描边 + RoundJoin 圆角连接。"""
         bar = h * 0.26 + pad
         path = QPainterPath()
         path.moveTo(x, y + bar / 2)
@@ -597,151 +585,12 @@ class ZLogoFace(QWidget):
         p.drawPath(path)
 
 
-# ========== Windows helpers: focus ZCode, detect its process ==========
-if sys.platform == "win32":
-    import ctypes
-    from ctypes import wintypes
-    _u32 = ctypes.windll.user32
-    _k32 = ctypes.windll.kernel32
-    _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-else:
-    _u32 = _k32 = None
-    _ENUMPROC = None
-
-
-def _zcode_windows():
-    """Visible top-level ZCode.exe windows → [(hwnd, title), ...]."""
-    if _u32 is None:
-        return []
-    out = []
-
-    def _cb(h, l):
-        try:
-            if not _u32.IsWindowVisible(h):
-                return True
-            pid = wintypes.DWORD()
-            _u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
-            k = _k32.OpenProcess(0x1000, False, pid.value)
-            if not k:
-                return True
-            try:
-                buf = ctypes.create_unicode_buffer(512)
-                size = wintypes.DWORD(512)
-                if _k32.QueryFullProcessImageNameW(k, 0, buf, ctypes.byref(size)):
-                    if "zcode" in os.path.basename(buf.value).lower():
-                        n = _u32.GetWindowTextLengthW(h)
-                        tb = ctypes.create_unicode_buffer(n + 1)
-                        _u32.GetWindowTextW(h, tb, n + 1)
-                        out.append((h, tb.value))
-            finally:
-                _k32.CloseHandle(k)
-        except Exception:
-            pass
-        return True
-
-    cb = _ENUMPROC(_cb)
-    _u32.EnumWindows(cb, 0)
-    return out
-
-
-def activate_zcode():
-    """Bring the ZCode window to the front (restore if minimized)."""
-    wins = _zcode_windows()
-    if not wins:
-        return False
-    hwnd = wins[0][0]
-    try:
-        if _u32.IsIconic(hwnd):
-            _u32.ShowWindow(hwnd, 9)   # SW_RESTORE
-        else:
-            _u32.ShowWindow(hwnd, 5)   # SW_SHOW
-        fg = _u32.GetForegroundWindow()
-        cur = _k32.GetCurrentThreadId()
-        fgt = _u32.GetWindowThreadProcessId(fg, None) if fg else 0
-        if fgt and fgt != cur:
-            _u32.AttachThreadInput(cur, fgt, True)
-        _u32.SetForegroundWindow(hwnd)
-        _u32.SetFocus(hwnd)
-        if fgt and fgt != cur:
-            _u32.AttachThreadInput(cur, fgt, False)
-        return True
-    except Exception:
-        return False
-
-
-def _zcode_process_running():
-    """Whether a ZCode.exe process is alive (tool-help snapshot, <5ms)."""
-    if _k32 is None:
-        return True
-    TH32CS_SNAPPROCESS = 0x2
-
-    class _PE32(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", ctypes.c_wchar * 260)]
-
-    snap = _k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == -1:
-        return True
-    found = False
-    try:
-        e = _PE32()
-        e.dwSize = ctypes.sizeof(e)
-        if _k32.Process32FirstW(snap, ctypes.byref(e)):
-            while True:
-                if "zcode" in str(e.szExeFile).lower():
-                    found = True
-                    break
-                if not _k32.Process32NextW(snap, ctypes.byref(e)):
-                    break
-    finally:
-        _k32.CloseHandle(snap)
-    return found
-
-
-class ZCodeProcessMonitor(QObject):
-    """Lifecycle monitor: when the ZCode process closes, the pet exits too.
-    Only triggers after the ZCode process has been seen at least once;
-    2 consecutive misses before exiting (ZCode restarts won't kill it)."""
-
-    def __init__(self, log_fn, on_closed, interval_ms=4000):
-        super().__init__()
-        self._log = log_fn
-        self._on_closed = on_closed
-        self.seen = False
-        self.miss = 0
-        self.timer = QTimer(self, interval=interval_ms, timeout=self._check)
-        self.timer.start()
-
-    def _check(self):
-        running = _zcode_process_running()
-        if running:
-            if not self.seen:
-                self._log("lifecycle", T("log_lc_seen"))
-            self.seen = True
-            self.miss = 0
-        elif self.seen:
-            self.miss += 1
-            if self.miss >= 2:
-                self._log("lifecycle", T("log_lc_exit"))
-                self.timer.stop()
-                self._on_closed()
-
-
-# ========== Bubble: foldable stack of task cards ==========
+# ========== 状态气泡：可折叠的多卡片任务列表 ==========
 class BubbleWindow(QWidget):
-    """Task cards floating above the pet (ChatGPT-pet style):
-    folded = the most relevant card plus un-viewed done cards;
-    expanded = one card per session. Click a card → jump to ZCode;
-    click empty space → fold/unfold; follows the pet; stays pinned while
-    anything needs attention, hides when all cards are viewed."""
+    """悬浮在小宠上方的任务卡片堆（类 ChatGPT 桌宠样式）：
+    折叠 = 只显示当前最重要的一张卡；展开 = 每个会话一张卡竖向堆叠。
+    点卡片跳转对应会话的 ZCode 窗口；点卡片外空白切换折叠/展开；
+    跟随小宠移动；20 秒无事件自动收起（任务进行中常驻）。"""
 
     CARD_H = 62
     GAP = 6
@@ -750,15 +599,15 @@ class BubbleWindow(QWidget):
     def __init__(self):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle("ZCode Pet")
+        self.setWindowTitle("ZCode Pet 状态")
         self.setStyleSheet(STYLE)
         self.setFixedWidth(BUBBLE_W)
         self.outer = QVBoxLayout(self)
         self.outer.setContentsMargins(0, 0, 0, 0)
         self.outer.setSpacing(self.GAP)
         self.card_sids = []
-        self.on_card = None
-        self.on_background = None
+        self.on_card = None        # callback(sid)
+        self.on_background = None  # callback()
 
     @staticmethod
     def _ellipsize(t, n):
@@ -766,13 +615,12 @@ class BubbleWindow(QWidget):
         return t[:n] + "…" if len(t) > n else t
 
     def rebuild(self, cards, sids):
+        """cards: [(title, status, icon, color), ...]；sids 与之对应。"""
         self.card_sids = list(sids)
         while self.outer.count():
             item = self.outer.takeAt(0)
-            w = item.widget()
-            if w:
-                w.hide()          # 立即从绘制中移除，避免半透明残影
-                w.deleteLater()
+            if item.widget():
+                item.widget().deleteLater()
         for (title, status, icon, color) in cards:
             f = QFrame()
             f.setObjectName("bubble")
@@ -819,8 +667,8 @@ class BubbleWindow(QWidget):
         self.raise_()
 
     def reposition(self, pet):
-        """Above the pet, centered; flips below when the top has no room;
-        clamped to the pet's screen (taskbar excluded)."""
+        """底边贴着小宠上方居中；顶部放不下且下方放得下时翻到小宠下方；
+        钳在小宠所在屏幕的可用区域内（不遮任务栏）。"""
         center = pet.geometry().center()
         scr = QGuiApplication.screenAt(center)
         if scr is None:
@@ -832,12 +680,12 @@ class BubbleWindow(QWidget):
         if y < geo.top() + 2:
             below = pet.y() + pet.height() + 6
             if below + self.height() <= geo.bottom() - 2:
-                y = below
+                y = below   # 顶部没空间 → 翻到小宠下方
         y = max(y, geo.top() + 2)
         self.move(x, y)
 
 
-# ========== Main window: pet + card stack ==========
+# ========== 主窗口：小宠 + 轻状态气泡 ==========
 STYLE = """
 QLabel {{ color:{FG}; font-family:'Segoe UI'; font-size:13px; background:transparent; }}
 QLabel#chip {{ font-family:'Segoe UI','Microsoft YaHei'; font-size:11px;
@@ -854,6 +702,8 @@ QMenu::item:selected {{ background:{BRAND}; color:{BG}; }}
 QMenu::separator {{ height:1px; background:{BORDER}; margin:3px 0; }}
 """.format(BG=BG, BORDER=BORDER, FG=FG, BRAND=BRAND, FG_SUBTLE=FG_SUBTLE)
 
+PHASE_NAME = {"idle": "Idle", "thinking": "Thinking", "executing": "Executing",
+              "waiting": "Waiting", "done": "Done"}
 PHASE_COLOR = {"idle": FG_SUBTLE, "thinking": WARNING, "executing": BRAND,
                "waiting": WAITING, "done": SUCCESS}
 
@@ -872,6 +722,7 @@ class PetWindow(QWidget):
         self.setWindowTitle("ZCode Pet")
         self.setStyleSheet(STYLE)
 
+        # ---- 多会话状态：sid -> session dict ----
         self.sess = {}
         self.sessions = set()
         self._seen_events = set()
@@ -881,9 +732,15 @@ class PetWindow(QWidget):
         self._face_mood = "idle"
         self._bubble_text = ""
         self._bubble_until = 0.0
-        self.bubble_expanded = False
+        self.bubble_expanded = False   # 气泡：False=折叠(单卡) True=展开(多卡)
         self._bubble_sig = None
-        self._bubble_manual = False
+        self._bubble_manual = False    # 用户手动隐藏后，任务进行中也不自动弹出
+        try:
+            self.pet_scale = float(QSettings("ZCode", "ZCodePet")
+                                   .value("scale", 1.0))
+        except Exception:
+            self.pet_scale = 1.0
+        self.pet_scale = min(2.0, max(0.6, self.pet_scale))
 
         self._build_ui()
         self._clock = QTimer(self, timeout=self._tick_clock, interval=1000)
@@ -893,6 +750,7 @@ class PetWindow(QWidget):
         self._bubble_timer = QTimer(self, singleShot=True, interval=20000,
                                     timeout=self._auto_hide_bubble)
 
+        # ---- 事件服务 ----
         self.srv = None
         self.port = None
         if server:
@@ -901,18 +759,22 @@ class PetWindow(QWidget):
                 BRIDGE.event_received.connect(self.handle_event)
                 self.port = self.srv.port
 
+        # ---- 常驻隧道 ----
         self.tunnels = None
         if server and os.path.exists(TUNNELS_PATH):
             self.tunnels = TunnelManager(self._log)
 
+        # ---- 生命周期：跟随 ZCode 进程（ZCode 关闭 → 桌宠退出）----
         self.lifecycle = None
         if server and sys.platform == "win32":
             self.lifecycle = ZCodeProcessMonitor(self._log, self._quit)
 
+        # ---- 托盘 ----
         self.tray = None
         if tray and QSystemTrayIcon.isSystemTrayAvailable():
             self._init_tray()
 
+        # ---- 全局热键 ----
         self.hotkey_ok = False
         self._hk_filter = None
         if hotkey and sys.platform == "win32":
@@ -926,7 +788,7 @@ class PetWindow(QWidget):
             except Exception:
                 pass
 
-        self.setFixedSize(*PET_SIZE)
+        self._apply_size()
         self._restore_pos()
 
     # ---------- UI ----------
@@ -937,15 +799,16 @@ class PetWindow(QWidget):
         v.setSpacing(2)
         self.v = v
 
+        # 状态气泡：独立置顶横幅小窗（宽 300，居中悬于小宠上方）
         self.bwin = BubbleWindow()
         self.bwin.on_card = self._on_card_click
         self.bwin.on_background = self._toggle_fold
 
         self.face = ZLogoFace()
-        self.face.setFixedWidth(136)
+        self.face.setFixedWidth(136)   # 窗口收窄后锁定 Z 的绘制宽度
         v.addWidget(self.face, 0, Qt.AlignHCenter)
 
-        self.chip = QLabel(T("chip_idle"))
+        self.chip = QLabel("● idle · 待命")
         self.chip.setObjectName("chip")
         self.chip.setAlignment(Qt.AlignCenter)
         self.chip.setFixedHeight(26)
@@ -960,7 +823,7 @@ class PetWindow(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.root)
 
-    def _paint_tray_icon(self):
+    def _init_tray(self):
         pm = QPixmap(32, 32)
         pm.fill(Qt.transparent)
         pt = QPainter(pm)
@@ -979,25 +842,20 @@ class PetWindow(QWidget):
         pt.setBrush(Qt.NoBrush)
         pt.drawPath(path)
         pt.end()
-        return QIcon(pm)
-
-    def _build_tray_menu(self):
-        menu = QMenu()
-        menu.addAction(T("menu_showhide"), self.toggle_visible)
-        menu.addAction(T("menu_fold"), self._toggle_bubble)
-        menu.addAction(T("menu_demo"), self.run_demo)
-        menu.addSeparator()
-        menu.addAction(T("menu_reset"), self._reset_pos)
-        menu.addSeparator()
-        menu.addAction(T("menu_quit"), self._quit)
-        return menu
-
-    def _init_tray(self):
-        icon = self._paint_tray_icon()
+        icon = QIcon(pm)
         self.setWindowIcon(icon)
+
         self.tray = QSystemTrayIcon(icon, self)
-        self.tray.setToolTip(T("tray_tip"))
-        self.tray.setContextMenu(self._build_tray_menu())
+        self.tray.setToolTip("ZCode Pet — 任务进度桌宠")
+        menu = QMenu()
+        menu.addAction("显示 / 隐藏", self.toggle_visible)
+        menu.addAction("气泡：折叠/展开", self._toggle_bubble)
+        menu.addAction("演示一轮任务", self.run_demo)
+        menu.addSeparator()
+        menu.addAction("重置位置", self._reset_pos)
+        menu.addSeparator()
+        menu.addAction("退出", self._quit)
+        self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray)
         self.tray.show()
 
@@ -1005,7 +863,7 @@ class PetWindow(QWidget):
         if reason == QSystemTrayIcon.Trigger:
             self.toggle_visible()
 
-    # ---------- position ----------
+    # ---------- 位置 ----------
     def _default_pos(self):
         geo = QGuiApplication.primaryScreen().availableGeometry()
         return QPoint(geo.right() - self.width() - 44, geo.bottom() - self.height() - 56)
@@ -1017,7 +875,6 @@ class PetWindow(QWidget):
             self.move(pos)
         else:
             self.move(self._default_pos())
-        self._clamp_pos()
 
     def _on_screen(self, pos):
         for scr in QGuiApplication.screens():
@@ -1026,6 +883,8 @@ class PetWindow(QWidget):
         return False
 
     def _clamp_pos(self):
+        """边缘保护：把窗口整个钳在它所在屏幕的可用区域内（贴边停住，
+        不遮任务栏；多显示器下跟随宠物中心所在的屏幕）。"""
         center = self.geometry().center()
         scr = QGuiApplication.screenAt(center)
         if scr is None:
@@ -1040,6 +899,23 @@ class PetWindow(QWidget):
     def _reset_pos(self):
         self.move(self._default_pos())
 
+    # ---------- 大小调节 ----------
+    def _apply_size(self):
+        """按 pet_scale 应用窗口/字体尺寸（用户右键可调，设置持久化）。"""
+        sc = self.pet_scale
+        self.setFixedSize(int(PET_SIZE[0] * sc), int(PET_SIZE[1] * sc))
+        self.face.setFixedWidth(int(136 * sc))
+        self.chip.setFixedHeight(max(18, int(26 * sc)))
+        self._clamp_pos()
+        if self.bwin.isVisible():
+            self.bwin.reposition(self)
+
+    def _set_scale(self, v):
+        self.pet_scale = float(v)
+        QSettings("ZCode", "ZCodePet").setValue("scale", self.pet_scale)
+        self._apply_size()
+        self._log("info", "桌宠大小 → ×{0}".format(self.pet_scale))
+
     def _save_pos(self):
         QSettings("ZCode", "ZCodePet").setValue("pos", self.pos())
 
@@ -1048,22 +924,25 @@ class PetWindow(QWidget):
             self.bwin.reposition(self)
         e.accept()
 
-    # ---------- bubble ----------
+    # ---------- 状态气泡 ----------
     def _show_bubble(self):
         self._refresh_bubble()
         self.bwin.popup(self)
-        self._bubble_timer.start()
+        self._bubble_timer.start()   # 20 秒无事件自动收起（任务进行中会常驻）
 
     def _hide_bubble(self):
-        self._bubble_manual = True
+        self._bubble_manual = True   # 手动隐藏后，本任务期间不再自动弹出
         self.bwin.hide()
 
     def _auto_hide_bubble(self):
+        """定时检查：只要还有进行中的任务或未查看的完成卡片就常驻；
+        全部处理完（都已点击查看）才收起。"""
         if self._card_entries():
-            return   # active tasks / un-viewed done cards stay pinned
+            return
         self.bwin.hide()
 
     def _toggle_bubble(self):
+        """隐藏时弹出（折叠态）；可见时在 折叠/展开 之间切换。"""
         if not self.bwin.isVisible():
             self.bubble_expanded = False
             self._show_bubble()
@@ -1074,6 +953,7 @@ class PetWindow(QWidget):
             self._bubble_timer.start()
 
     def _toggle_fold(self):
+        """点卡片外空白：折叠/展开切换。"""
         self.bubble_expanded = not self.bubble_expanded
         self._refresh_bubble()
         self.bwin.reposition(self)
@@ -1081,19 +961,20 @@ class PetWindow(QWidget):
 
     def _jump_zcode(self):
         ok = activate_zcode()
-        self._log("info", T("log_jump", ok=T("ok_log") if ok else T("ok_miss")))
+        self._log("info", "跳转 ZCode 窗口 {0}".format("✓" if ok else "（未找到）"))
 
     def _on_card_click(self, sid):
         s = self.sess.get(sid, {})
         ok = activate_zcode()
+        # 完成的卡片：点击 = 查看，从此不再显示（含展开态）
         if s and s["task"] and s["state"] in ("done", "idle") and not s.get("acked"):
             s["acked"] = True
-            self._log("info", T("log_card_ack", sid=sid[:8]))
-        self._log("info", T("log_jump_card", sid=sid[:8],
-                            r=T("remote_log") if s.get("is_remote") else "",
-                            ok=T("ok_log") if ok else T("ok_miss")))
+            self._log("info", "卡片已查看并移除（会话 #{0}）".format(sid[:8]))
+        self._log("info", "点击卡片跳转 ZCode（会话 #{0}{1}）{2}".format(
+            sid[:8], "·远程" if s.get("is_remote") else "",
+            "✓" if ok else "（未找到窗口）"))
         if not self._card_entries():
-            self.bwin.hide()
+            self.bwin.hide()          # 所有卡片都已处理 → 收起气泡
         else:
             self._refresh_bubble()
             self.bwin.reposition(self)
@@ -1107,7 +988,7 @@ class PetWindow(QWidget):
             self.raise_()
             self.activateWindow()
 
-    # ---------- mouse / menu ----------
+    # ---------- 拖动 / 点击 / 右键 ----------
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self._drag_from = e.globalPos()
@@ -1121,51 +1002,39 @@ class PetWindow(QWidget):
                 self._moved = True
             if self._moved:
                 self.move(self._win_from + d)
-                self._clamp_pos()
+                self._clamp_pos()   # 拖动全程贴边保护，拖不出桌面
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self._drag_from is not None:
             if not self._moved and self.face.geometry().contains(e.pos()):
-                self._jump_zcode()
+                self._jump_zcode()   # 单击宠物 → 跳转 ZCode
             self._drag_from = None
             self._clamp_pos()
             self._save_pos_timer.start(50)
 
     def contextMenuEvent(self, e):
         m = QMenu(self)
-        m.addAction(T("menu_fold") if self.bwin.isVisible() else T("menu_cards"),
+        m.addAction("气泡：折叠/展开" if self.bwin.isVisible() else "显示任务卡片",
                     self._toggle_bubble)
         if self.bwin.isVisible():
-            m.addAction(T("menu_hide"), self._hide_bubble)
-        m.addAction(T("menu_demo"), self.run_demo)
-        m.addAction(T("menu_reset"), self._reset_pos)
-        lang_menu = m.addMenu(T("menu_lang"))
-        for code in ("zh", "en"):
-            a = lang_menu.addAction(I18N[code]["lang_name"])
-            a.setCheckable(True)
-            a.setChecked(CURRENT_LANG == code)
-            a.triggered.connect(lambda _, c=code: self._set_lang(c))
+            m.addAction("隐藏任务卡片", self._hide_bubble)
+        size_menu = m.addMenu("大小")
+        for label, val in (("小 ×0.8", 0.8), ("标准 ×1.0", 1.0),
+                           ("大 ×1.25", 1.25), ("特大 ×1.5", 1.5)):
+            act = size_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(abs(self.pet_scale - val) < 0.01)
+            act.triggered.connect(lambda _=False, v=val: self._set_scale(v))
+        m.addAction("演示一轮任务", self.run_demo)
+        m.addAction("重置位置", self._reset_pos)
         m.addSeparator()
-        m.addAction(T("menu_quit"), self._quit)
+        m.addAction("退出", self._quit)
         m.exec_(e.globalPos())
 
-    def _set_lang(self, code):
-        if code == CURRENT_LANG:
-            return
-        set_lang(code)
-        self._log("info", T("log_lang"))
-        self._bubble_sig = None
-        self._refresh_chip()
-        if self.bwin.isVisible():
-            self._refresh_bubble()
-            self.bwin.reposition(self)
-        if self.tray:
-            self.tray.setToolTip(T("tray_tip"))
-            self.tray.setContextMenu(self._build_tray_menu())
-
-    # ---------- events ----------
+    # ---------- 事件处理 ----------
     @staticmethod
     def _normalize(ev):
+        """兼容 snake_case（本机）与 camelCase（部分版本）两种事件字段。"""
         name = (ev.get("hook_event_name") or ev.get("hookEventName")
                 or ev.get("event") or "Unknown")
         sid = str(ev.get("session_id") or ev.get("sessionId") or "-")
@@ -1192,16 +1061,18 @@ class PetWindow(QWidget):
         if not isinstance(ev, dict):
             ev = {"raw": str(ev)}
         if not ev:
-            self._log("warn", T("log_empty"))
+            self._log("warn", "收到空事件（钩子未传 stdin，请检查远程钩子版本）")
             return
         e = self._normalize(ev)
+        if e["name"] == "Show":
+            self._ev_Show()
+            return
         sid = e["sid"]
         if sid not in self.sessions:
             self.sessions.add(sid)
             s0 = self._sess(sid, e["cwd"])
-            self._log("session", T("log_join", sid=sid[:8],
-                                   where=T("where_log") if s0["is_remote"] else T("local_log"),
-                                   n=len(self.sessions)))
+            self._log("session", "会话接入 #{0}（{1}，共 {2} 个）".format(
+                sid[:8], "远程" if s0["is_remote"] else "本机", len(self.sessions)))
         if e["name"] not in self._seen_events:
             self._seen_events.add(e["name"])
             try:
@@ -1215,15 +1086,14 @@ class PetWindow(QWidget):
             try:
                 handler(e, s)
             except Exception as ex:
-                self._log("fail", T("log_err", n=e["name"], e=ex))
+                self._log("fail", "处理 {0} 出错: {1}".format(e["name"], ex))
         else:
-            self._log("info", T("log_unknown", n=e["name"]))
+            self._log("info", "未知事件 {0}".format(e["name"]))
         self._apply_aggregate()
         self._refresh_chip()
         self._refresh_bubble()
 
-    @staticmethod
-    def _tool_snippet(ti):
+    def _tool_snippet(self, ti):
         if isinstance(ti, dict):
             for k in ("command", "file_path", "path", "pattern", "url", "query", "prompt"):
                 if ti.get(k):
@@ -1231,9 +1101,19 @@ class PetWindow(QWidget):
                     return sv[:72] + ("…" if len(sv) > 72 else "")
         return ""
 
+    def _ev_Show(self):
+        """/show 触发：显示并置顶（双击 bat 或拉起器钩子）。"""
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        self._clamp_pos()
+        self._log("info", "桌宠已显示并置顶")
+
     def _ev_SessionStart(self, e, s):
-        self._log("session", T("log_ready", src=e.get("source") or e.get("reason") or "startup"))
-        self._bubble(T("bubble_ready"))
+        self._log("session", "会话就绪（{0}）".format(
+            e.get("source") or e.get("reason") or "startup"))
+        self._bubble("就绪 (•̀ᴗ•́)و")
 
     def _ev_UserPromptSubmit(self, e, s):
         s["state"] = "thinking"
@@ -1243,67 +1123,72 @@ class PetWindow(QWidget):
         s["t0"] = time.time()
         s["done_at"] = 0.0
         s["result"] = ""
-        s["acked"] = False
+        s["acked"] = False            # 新任务开始：卡片重新进入常驻列表
         self._bubble_manual = False
         self._show_bubble()
-        self._log("task", T("log_new_task", w=T("where_log") if s["is_remote"] else "",
-                            t=e["prompt"][:80] + ("…" if len(e["prompt"]) > 80 else "")))
+        self._log("task", "{0}新任务：{1}".format(
+            "［远程］" if s["is_remote"] else "",
+            e["prompt"][:80] + ("…" if len(e["prompt"]) > 80 else "")))
+        self._bubble("开跑 (๑•̀ㅂ•́)و")
 
     def _ev_PreToolUse(self, e, s):
         s["tool"] = e["tool"]
         s["state"] = "executing"
         if s["t0"] is None:
-            s["t0"] = time.time()
+            s["t0"] = time.time()   # 错过 UserPromptSubmit 的会话也从首步开始计时
         snip = self._tool_snippet(e["tool_input"])
         self._log("run", "{0}▶ {1} {2}".format(
-            T("where_log") if s["is_remote"] else "", e["tool"], snip))
+            "［远程］" if s["is_remote"] else "", e["tool"], snip))
 
     def _ev_PostToolUse(self, e, s):
         s["steps"] += 1
         if e["tool"] != "?":
             s["tool"] = e["tool"]
-        self._log("ok", T("log_tool_done", w=T("where_log") if s["is_remote"] else "",
-                          tool=s["tool"] or "?", n=s["steps"]))
+        self._log("ok", "{0}✓ {1} 完成 · 第 {2} 步".format(
+            "［远程］" if s["is_remote"] else "", s["tool"] or "?", s["steps"]))
 
     def _ev_PostToolUseFailure(self, e, s):
         err = e["error"]
         if isinstance(err, dict):
             err = json.dumps(err, ensure_ascii=False)
-        self._log("fail", T("log_tool_fail", tool=e["tool"], e=str(err)[:160]))
+        self._log("fail", "✗ {0} 失败 {1}".format(e["tool"], str(err)[:160]))
         self.face.shake()
 
     def _ev_PermissionRequest(self, e, s):
         s["tool"] = e["tool"]
         s["state"] = "waiting"
         snip = self._tool_snippet(e["tool_input"])
-        self._log("warn", T("log_perm", tool=e["tool"], snip=snip))
-        self._bubble(T("bubble_wait"))
+        self._log("warn", "⏸ 等待权限确认：{0} {1}".format(e["tool"], snip))
+        self._bubble("ZCode 在等你确认 (・_・;)")
         self._show_bubble()
         if self.tray:
             self.tray.showMessage("ZCode Pet",
-                                  "{0}{1}".format(T("where_log") if s["is_remote"] else "",
-                                                  e["tool"]),
+                                  "⏸ {0}等待你确认：{1}".format(
+                                      "远程服务器 " if s["is_remote"] else "", e["tool"]),
                                   QSystemTrayIcon.Warning, 6000)
 
     def _ev_Stop(self, e, s):
         s["state"] = "done"
         s["done_at"] = time.time()
         if not s["task"]:
-            s["task"] = T("untitled_log")
+            s["task"] = "（未命名任务）"   # 错过任务开头也要有标题，保证完成卡常驻
         if e["result"]:
             s["result"] = e["result"]
-        self._log("ok", T("log_stop", w=T("where_log") if s["is_remote"] else "",
-                          n=s["steps"], t=self._elapsed_str(s)))
-        self._bubble(T("bubble_done"))
+        self._log("ok", "{0}★ 任务完成 · {1} 步 · 用时 {2}".format(
+            "［远程］" if s["is_remote"] else "", s["steps"], self._elapsed_str(s)))
+        self._bubble("搞定！✓")
         self._show_bubble()
         if self.tray:
             self.tray.showMessage("ZCode Pet",
-                                  T("log_stop", w=T("where_log") if s["is_remote"] else "",
-                                    n=s["steps"], t=self._elapsed_str(s)),
+                                  "★ {0}任务完成 · {1} 步 · {2}".format(
+                                      "远程" if s["is_remote"] else "",
+                                      s["steps"], self._elapsed_str(s)),
                                   QSystemTrayIcon.Information, 5000)
 
-    # ---------- aggregation ----------
+    # ---------- 聚合显示 ----------
     def _pick_active(self):
+        """返回 (sid, s)：所有会话里优先级最高的状态（等确认>执行>思考>完成>空闲）。
+        done 超过停留时间自动回落 idle。并列时取最近有事件的。"""
         now = time.time()
         best = None
         for sid, s in self.sess.items():
@@ -1325,8 +1210,9 @@ class PetWindow(QWidget):
     def _active_count(self):
         return sum(1 for s in self.sess.values() if s["state"] != "idle")
 
-    # ---------- UI refresh ----------
+    # ---------- UI 刷新 ----------
     def _bubble(self, text):
+        """状态条短暂显示一句气泡文案，6 秒后淡回状态文本。"""
         self._bubble_text = text
         self._bubble_until = time.time() + 6
 
@@ -1337,37 +1223,40 @@ class PetWindow(QWidget):
         return "{0:02d}:{1:02d}".format(sec // 60, sec % 60)
 
     def _state_line(self, s, compact=False):
+        """compact=True 供小宠脚下的窄状态条使用（约 136px 宽）。"""
         t = self._elapsed_str(s)
-        remote = s["is_remote"]
+        remote_c = s["is_remote"]
         if compact:
-            tag = "☁" if remote else ""
+            tag = "☁" if remote_c else ""
             tool = s["tool"] or ""
             if len(tool) > 8:
                 tool = tool[:8] + "…"
             if s["state"] == "thinking":
-                return tag + T("chip_thinking"), WARNING
+                return "{0}◐思考中".format(tag), WARNING
             if s["state"] == "executing":
-                return tag + T("chip_exec", tool=tool, steps=s["steps"], t=t), BRAND
+                return "{0}▸{1}·{2}步·{3}".format(tag, tool, s["steps"], t), BRAND
             if s["state"] == "waiting":
-                return tag + T("chip_wait", tool=tool), WAITING
+                return "{0}⏸确认{1}".format(tag, tool), WAITING
             if s["state"] == "done":
-                return tag + T("chip_done", steps=s["steps"], t=t), SUCCESS
-            return T("chip_idle"), FG_SUBTLE
-        w = T("where_remote") if remote else ""
+                return "{0}✓{1}步·{2}".format(tag, s["steps"], t), SUCCESS
+            return "●待命", FG_SUBTLE
+        where = "远程 · " if remote_c else ""
         if s["state"] == "thinking":
-            return T("full_thinking", w=w), WARNING
+            return "◐ {0}thinking · 分析任务…".format(where), WARNING
         if s["state"] == "executing":
-            return T("full_exec", w=w, tool=s["tool"] or "…", steps=s["steps"], t=t), BRAND
+            return "▸ {0}{1} · {2}步 · {3}".format(where, s["tool"] or "…",
+                                                   s["steps"], t), BRAND
         if s["state"] == "waiting":
-            return T("full_wait", w=w, tool=s["tool"] or ""), WAITING
+            return "⏸ {0}等你确认 {1}".format(where, s["tool"] or ""), WAITING
         if s["state"] == "done":
-            return T("full_done", w=w, steps=s["steps"], t=t), SUCCESS
-        return T("full_idle"), FG_SUBTLE
+            return "✓ {0}done · {1}步 · {2}".format(where, s["steps"], t), SUCCESS
+        return "● idle · 待命", FG_SUBTLE
 
     def _tick_clock(self):
         _, s = self._pick_active()
         if s["state"] in ("thinking", "executing", "waiting"):
             self._refresh_chip()
+        # 有应显示的卡片（进行中 / 未查看的完成卡片）且未手动隐藏 → 常驻弹出
         if self._card_entries() and not self.bwin.isVisible() and not self._bubble_manual:
             self._show_bubble()
         if self.bwin.isVisible():
@@ -1380,38 +1269,44 @@ class PetWindow(QWidget):
         n = self._active_count()
         if n > 1 and not self._bubble_text:
             txt = txt + "+{0}".format(n - 1)
+        # 短暂气泡文案优先于状态文本
         if self._bubble_text and time.time() < self._bubble_until:
             txt, c = self._bubble_text, PHASE_COLOR.get(s["state"], FG_SUBTLE)
         elif self._bubble_text:
             self._bubble_text = ""
         self.chip.setText(html.escape(txt))
         self.chip.setStyleSheet("color:{0};font-family:'Segoe UI','Microsoft YaHei';"
-                                "font-size:11px;font-weight:bold;".format(c))
+                                "font-size:{1}px;font-weight:bold;"
+                                .format(c, max(9, round(11 * self.pet_scale))))
 
     def _card_texts(self, s):
-        where = T("where_remote") if s["is_remote"] else ""
+        """单个会话 → 卡片 (title, status, icon, color)。"""
+        where = "远程 · " if s["is_remote"] else ""
         icon, color = {"waiting": ("⏸", WAITING), "executing": ("▸", BRAND),
                        "thinking": ("◐", WARNING), "done": ("✓", SUCCESS),
                        "idle": ("✓", SUCCESS)}.get(s["state"], ("●", FG_SUBTLE))
-        title = s["task"] if s["task"] else T("card_untitled")
+        title = s["task"] if s["task"] else "（未命名任务）"
         if s["state"] in ("done", "idle") and s["task"]:
+            # 已完成（含超过停留时间转为 idle 的），持续显示直到点击查看
             if s["result"]:
-                status = T("card_done_res", w=where, result=s["result"])
+                status = "{0}已完成 · {1}".format(where, s["result"])
             else:
-                status = T("card_done", w=where, steps=s["steps"],
-                           t=self._elapsed_str(s))
+                status = "{0}已完成 · {1}步 · {2}".format(where, s["steps"],
+                                                          self._elapsed_str(s))
         elif s["state"] == "executing":
-            status = T("card_exec", w=where, tool=s["tool"] or "")
+            status = "{0}正在执行 · {1}".format(where, s["tool"] or "")
         elif s["state"] == "waiting":
-            status = T("card_wait", w=where, tool=s["tool"] or "")
+            status = "{0}等你确认 · {1}".format(where, s["tool"] or "")
         elif s["state"] == "thinking":
-            status = T("card_think", w=where)
+            status = "{0}分析任务…".format(where)
         else:
-            status = T("card_idle", w=where)
+            status = "{0}空闲".format(where)
         return (BubbleWindow._ellipsize(title, 24),
                 BubbleWindow._ellipsize(status, 34), icon, color)
 
     def _card_entries(self):
+        """当前应显示的卡片：进行中的会话 + 完成后尚未点击查看的会话。
+        已点击查看（acked）的不再出现；按最近活动排序，最多 6 张。"""
         out = [(sid, s) for sid, s in self.sess.items()
                if s["state"] in ("thinking", "executing", "waiting")
                or (s["state"] == "done" and not s.get("acked"))
@@ -1422,6 +1317,8 @@ class PetWindow(QWidget):
     def _refresh_bubble(self):
         entries = self._card_entries()
         if not self.bubble_expanded:
+            # 折叠：聚合优先级最高的卡 + 其他会话中未查看的完成卡
+            # （完成卡等用户点击，不因其他会话活跃而被挤掉）
             active_sid, _ = self._pick_active()
             agg = [(sid, s) for sid, s in entries if sid == active_sid]
             pending = [(sid, s) for sid, s in entries
@@ -1436,6 +1333,7 @@ class PetWindow(QWidget):
             self.bwin.rebuild(cards, sids)
 
     def _log(self, kind, msg):
+        """日志落盘（pet.log），不占桌面 UI。"""
         try:
             if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 512 * 1024:
                 open(LOG_PATH, "w", encoding="utf-8").close()
@@ -1444,20 +1342,14 @@ class PetWindow(QWidget):
         except Exception:
             pass
 
-    # ---------- demo ----------
+    # ---------- 演示 ----------
     def run_demo(self):
         self._hide_bubble()
-        seq = []
-        for delay, payload in DEMO_SEQUENCE:
-            p = dict(payload)
-            if p.get("hook_event_name") == "UserPromptSubmit":
-                p["prompt"] = T("demo_prompt")
-            seq.append((delay, p))
         t0 = 400
-        for delay, payload in seq:
+        for delay, payload in DEMO_SEQUENCE:
             QTimer.singleShot(t0 + delay, lambda p=payload: self.handle_event(dict(p)))
 
-    # ---------- quit ----------
+    # ---------- 退出 ----------
     def _quit(self):
         self._save_pos()
         if self.srv:
@@ -1480,10 +1372,11 @@ class PetWindow(QWidget):
         e.accept()
 
 
-# ========== demo script ==========
+# ========== 演示脚本 ==========
 DEMO_SEQUENCE = [
     (0,     {"hook_event_name": "SessionStart", "session_id": "demo-0001", "source": "startup"}),
-    (900,   {"hook_event_name": "UserPromptSubmit", "session_id": "demo-0001"}),
+    (900,   {"hook_event_name": "UserPromptSubmit", "session_id": "demo-0001",
+             "prompt": "修复登录页在 1080p 下的按钮折行问题，并补充回归测试"}),
     (2100,  {"hook_event_name": "PreToolUse", "session_id": "demo-0001",
              "tool_name": "Read", "tool_input": {"file_path": "src/pages/Login.tsx"}}),
     (2800,  {"hook_event_name": "PostToolUse", "session_id": "demo-0001", "tool_name": "Read"}),
@@ -1509,14 +1402,14 @@ DEMO_SEQUENCE = [
 ]
 
 
-# ========== selftest: render every state offscreen ==========
+# ========== 自检：离屏渲染各状态 PNG ==========
 def run_selftest():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication(sys.argv)
     try:
         from PyQt5.QtGui import QFontDatabase
         for f in ("consola.ttf", "segoeui.ttf", "segoeuib.ttf", "arial.ttf",
-                  "arialbd.ttf", "seguisym.ttf", "segoeui-symbol.ttf", "msyh.ttc", "msyhbd.ttc", "simhei.ttf"):
+                  "arialbd.ttf", "msyh.ttc", "msyhbd.ttc", "simhei.ttf"):
             QFontDatabase.addApplicationFont("C:/Windows/Fonts/" + f)
     except Exception:
         pass
@@ -1529,7 +1422,8 @@ def run_selftest():
         for _ in range(3):
             app.processEvents()
         pet.face.tick = int(pet.face.tick) + 17
-        pet.grab().save(os.path.join(out, name + ".png"))
+        pm = pet.grab()
+        pm.save(os.path.join(out, name + ".png"))
 
     def snap_bubble(name):
         for _ in range(3):
@@ -1549,58 +1443,69 @@ def run_selftest():
     pet.handle_event({"hook_event_name": "PermissionRequest", "session_id": "st",
                       "tool_name": "Bash", "tool_input": {"command": "git commit -m fix"}})
     pet._show_bubble()
-    snap_bubble("4-waiting-bubble")
+    snap_bubble("4-waiting-bubble")   # 横幅气泡单独截图
     pet._hide_bubble()
     snap("4-waiting")
     pet.handle_event({"hook_event_name": "PostToolUse", "session_id": "st", "tool_name": "Edit"})
     pet.handle_event({"hook_event_name": "Stop", "session_id": "st"})
     snap("5-done")
     pet.handle_event({"hook_event_name": "UserPromptSubmit", "session_id": "remote-1",
-                      "sessionId": "remote-1", "cwd": "/home/yourname/proj",
+                      "sessionId": "remote-1", "cwd": "/home/sunhaiming/proj",
                       "prompt": "远程任务：重构 utils/date.py 并跑通单元测试"})
     pet.handle_event({"hook_event_name": "PreToolUse", "sessionId": "remote-1",
                       "toolName": "Bash", "tool_input": {"command": "pytest -q"}})
     pet._show_bubble()
-    snap_bubble("6-bubble")
+    snap_bubble("6-bubble")            # 折叠态：单卡
     pet.bubble_expanded = True
     pet._refresh_bubble()
-    snap_bubble("7-expanded")
-    pet._on_card_click("st")
-    snap_bubble("8-after-ack")
+    snap_bubble("7-expanded")          # 展开态：远程执行中 + 本机已完成未查看
+    pet._on_card_click("st")           # 点击已完成卡 → 跳转并移除
+    snap_bubble("8-after-ack")         # 只剩远程执行中的卡
     pet.handle_event({"hook_event_name": "Stop", "sessionId": "remote-1"})
-    pet._on_card_click("remote-1")
-    assert not pet.bwin.isVisible(), "bubble should hide after all cards viewed"
+    pet._on_card_click("remote-1")     # 最后一张卡也被查看 → 气泡自动收起
+    assert not pet.bwin.isVisible(), "所有卡片查看后气泡应自动收起"
     pet.bubble_expanded = False
     print("SELFTEST_OK " + out)
     return 0
 
 
-# ========== entry ==========
+# ========== 入口 ==========
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    ap = argparse.ArgumentParser(description="ZCode Pet — task progress desktop pet")
-    ap.add_argument("--demo", action="store_true", help="run a scripted demo after launch")
-    ap.add_argument("--selftest", action="store_true", help="render states to PNG and exit")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="event server port (8765)")
+    ap = argparse.ArgumentParser(description="ZCode Pet — 任务进度桌宠")
+    ap.add_argument("--demo", action="store_true", help="启动后自动演示一轮任务")
+    ap.add_argument("--selftest", action="store_true", help="离屏渲染各状态 PNG 后退出")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="事件服务端口（默认 8765）")
     args = ap.parse_args()
-
-    global CURRENT_LANG
-    CURRENT_LANG = _detect_lang()
 
     if args.selftest:
         sys.exit(run_selftest())
 
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    # 刻意不启用 Qt 自动高 DPI 缩放（AA_EnableHighDpiScaling）：
+    # 双屏 DPI 不同时它会反复重算窗口尺寸，导致桌宠忽大忽小。
+    # 关闭后按固定物理像素渲染——在任何屏幕上大小一致（与外接屏一致）。
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setApplicationName("ZCode Pet")
 
     lock = QLockFile(os.path.join(tempfile.gettempdir(), "zcode-pet.lock"))
     if not lock.tryLock(0):
-        print("ZCode Pet is already running / 桌宠已在运行。")
+        # 已有实例在跑：让它显示并置顶（双击 bat 的意义就在于"看到它"）
+        try:
+            import urllib.request
+            for p in range(8765, 8770):
+                try:
+                    urllib.request.urlopen("http://127.0.0.1:{0}/show".format(p),
+                                           timeout=0.6)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        print("ZCode Pet 已在运行（已请求显示）。")
         sys.exit(0)
 
     pet = PetWindow(server=True, tray=True, hotkey=True, port=args.port)
